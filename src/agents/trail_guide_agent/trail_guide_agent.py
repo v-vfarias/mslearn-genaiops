@@ -11,8 +11,8 @@ env_file = repo_root / '.env'
 load_dotenv(env_file)
 
 # Read instructions from prompt file
-prompt_file = Path(__file__).parent / 'prompts' / 'v2_instructions.txt'
-with open('prompts/v3_instructions.txt', 'r') as f:
+prompt_file = Path(__file__).parent / 'prompts' / 'v1_instructions.txt'
+with open(prompt_file, 'r') as f:
     instructions = f.read().strip()
 
 project_client = AIProjectClient(
