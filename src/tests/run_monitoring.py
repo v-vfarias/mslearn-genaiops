@@ -63,8 +63,11 @@ VERSIONS = ["v1", "v2", "v3"]
 
 
 def load_prompt(version: str) -> str:
-    """Load a prompt version from the prompts directory."""
-    return (PROMPTS_DIR / f"{version}_instructions.txt").read_text().strip()
+    """Load a prompt version, tolerating filenames with or without the `_instructions` suffix."""
+    candidate = PROMPTS_DIR / f"{version}_instructions.txt"
+    if not candidate.exists():
+        candidate = PROMPTS_DIR / f"{version}.txt"
+    return candidate.read_text().strip()
 
 
 def load_test_prompts() -> dict:

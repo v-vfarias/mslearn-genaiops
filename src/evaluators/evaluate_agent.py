@@ -15,7 +15,8 @@ import sys
 import time
 from pathlib import Path
 from dotenv import load_dotenv
-from azure.identity import DefaultAzureCredential
+import requests
+from azure.identity import ClientAssertionCredential, DefaultAzureCredential
 from azure.ai.projects import AIProjectClient
 from openai.types.eval_create_params import DataSourceConfigCustom
 from openai.types.evals.create_eval_jsonl_run_data_source_param import (
@@ -44,6 +45,34 @@ if not endpoint:
     print("       Add it to your .env file and try again.")
     sys.exit(1)
 
+
+def get_credential():
+    """Refresh-per-request Azure AD credential in GitHub Actions; DefaultAzureCredential otherwise."""
+    request_url = os.environ.get("ACTIONS_ID_TOKEN_REQUEST_URL")
+    request_token = os.environ.get("ACTIONS_ID_TOKEN_REQUEST_TOKEN")
+    tenant_id = os.environ.get("AZURE_TENANT_ID")
+    client_id = os.environ.get("AZURE_CLIENT_ID")
+
+    if not (request_url and request_token and tenant_id and client_id):
+        return DefaultAzureCredential()
+
+    def get_github_oidc_token(*_args, **_kwargs) -> str:
+        response = requests.get(
+            request_url,
+            params={"audience": "api://AzureADTokenExchange"},
+            headers={"Authorization": f"Bearer {request_token}"},
+            timeout=10,
+        )
+        response.raise_for_status()
+        return response.json()["value"]
+
+    return ClientAssertionCredential(
+        tenant_id=tenant_id,
+        client_id=client_id,
+        func=get_github_oidc_token,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Azure clients
 # ---------------------------------------------------------------------------
@@ -51,7 +80,7 @@ if not endpoint:
 # AIProjectClient connects to your Azure AI Foundry project
 project_client = AIProjectClient(
     endpoint=endpoint,
-    credential=DefaultAzureCredential(),
+    credential=get_credential(),
 )
 
 # The OpenAI-compatible client exposes the Evals API
@@ -331,11 +360,19 @@ def retrieve_and_display_results(eval_object, run):
         "groundedness":      [],
     }
 
+    def iter_metric_scores(item):
+        """Yield (metric_name, score) pairs, checking known output field names."""
+        candidates = getattr(item, "evaluator_outputs", None) or getattr(item, "results", None) or []
+        for output in candidates:
+            name = getattr(output, "name", None) or getattr(output, "metric", None)
+            score = getattr(output, "score", None)
+            if name is not None and score is not None:
+                yield name, score
+
     for item in scored_items:
-        if hasattr(item, "evaluator_outputs"):
-            for output in item.evaluator_outputs:
-                if output.name in scores and hasattr(output, "score"):
-                    scores[output.name].append(output.score)
+        for metric_name, metric_score in iter_metric_scores(item):
+            if metric_name in scores:
+                scores[metric_name].append(metric_score)
 
     # --- Build summary text (printed to console and written to file) ---
     # Everything written to `lines` ends up both on screen and in the file,
@@ -372,10 +409,11 @@ def retrieve_and_display_results(eval_object, run):
             pass_lines.append(f"  {label}: {rate:.1f}%")
 
     if not any_scores:
-        # Scores missing — the evaluation may have completed but returned no
-        # evaluator_outputs. Open the Report URL above to inspect in the portal.
         lines.append("  No scores returned — open Azure AI Foundry portal > Evaluations for details.")
         pass_lines.append("  No scores returned.")
+        if scored_items:
+            sample_fields = sorted(vars(scored_items[0]).keys()) if hasattr(scored_items[0], "__dict__") else []
+            lines.append(f"  Debug: fields on first output item: {sample_fields}")
 
     lines.extend(pass_lines)
     summary = "\n".join(lines)

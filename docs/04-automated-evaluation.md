@@ -420,6 +420,13 @@ The evaluation script integrates with GitHub Actions to automatically run evalua
 
     Create two federated credentials so the workflow can authenticate via OIDC for both manual runs and pull requests. GitHub sends a different token subject for each trigger type, so one credential is required per subject.
 
+    New GitHub repositories use a subject format that includes the numeric owner and repository IDs. Look these up first:
+
+    ```powershell
+    $repoInfo = Invoke-RestMethod -Uri "https://api.github.com/repos/<your-org>/<your-repo>"
+    "Owner ID: $($repoInfo.owner.id)  Repo ID: $($repoInfo.id)"
+    ```
+
     **Credential 1 — manual runs and pushes to main:**
 
     Create `federated-credential.json`:
@@ -428,10 +435,12 @@ The evaluation script integrates with GitHub Actions to automatically run evalua
     {
       "name": "github-actions",
       "issuer": "https://token.actions.githubusercontent.com",
-      "subject": "repo:<your-org>/<your-repo>:ref:refs/heads/main",
+      "subject": "repo:<your-org>@<ownerId>/<your-repo>@<repoId>:ref:refs/heads/main",
       "audiences": ["api://AzureADTokenExchange"]
     }
     ```
+
+    > **Note**: Older repositories not using the numeric ID format can use `repo:<your-org>/<your-repo>:ref:refs/heads/main` instead.
 
     ```powershell
     az ad app federated-credential create `
@@ -448,7 +457,7 @@ The evaluation script integrates with GitHub Actions to automatically run evalua
     {
       "name": "github-actions-pr",
       "issuer": "https://token.actions.githubusercontent.com",
-      "subject": "repo:<your-org>/<your-repo>:pull_request",
+      "subject": "repo:<your-org>@<ownerId>/<your-repo>@<repoId>:pull_request",
       "audiences": ["api://AzureADTokenExchange"]
     }
     ```
@@ -460,7 +469,7 @@ The evaluation script integrates with GitHub Actions to automatically run evalua
     Remove-Item federated-credential-pr.json
     ```
 
-    > **Important**: Replace `<your-org>/<your-repo>` with your exact GitHub username and repository name. Both values are case-sensitive. If either credential is missing, the workflow will fail with an `AADSTS700213` authentication error for that trigger type.
+    > **Important**: Replace `<your-org>`, `<your-repo>`, `<ownerId>`, and `<repoId>` with your exact values (case-sensitive names). If either credential is missing, or the subject format doesn't match what your repository actually issues, the workflow will fail with an `AADSTS700213` authentication error for that trigger type.
 
 1. **Configure GitHub Secrets**
 
@@ -692,33 +701,44 @@ Create `experiments/automated/model_comparison.md` with:
 
 ### OIDC login fails on PR workflows (`AADSTS700213`)
 
-**Symptom**: Workflow succeeds when triggered manually but fails with `AADSTS700213: No matching federated identity record found` when triggered by a pull request.
+**Symptom**: Workflow succeeds when triggered manually but fails with `AADSTS700213: No matching federated identity record found` when triggered by a pull request, or fails on **every** trigger even though the org/repo names look correct.
 
 **Resolution**:
 
-GitHub sends a different OIDC subject depending on the trigger event:
-- `workflow_dispatch` or `push` on main → subject is `repo:<org>/<repo>:ref:refs/heads/main`
-- `pull_request` → subject is `repo:<org>/<repo>:pull_request`
+There are two independent causes for this error — check both:
 
-You need **two** federated credentials, one per subject. Create the missing PR credential:
+1. **Missing PR-specific credential.** GitHub sends a different OIDC subject depending on the trigger event:
+   - `workflow_dispatch` or `push` on main → subject is `repo:<org>/<repo>:ref:refs/heads/main`
+   - `pull_request` → subject is `repo:<org>/<repo>:pull_request`
 
-```powershell
-# Create federated-credential-pr.json
-@"
-{
-  "name": "github-actions-pr",
-  "issuer": "https://token.actions.githubusercontent.com",
-  "subject": "repo:<your-org>/<your-repo>:pull_request",
-  "audiences": ["api://AzureADTokenExchange"]
-}
-"@ | Set-Content federated-credential-pr.json
+   You need **two** federated credentials, one per subject. Create the missing PR credential:
 
-az ad app federated-credential create `
-  --id "<appId>" `
-  --parameters @federated-credential-pr.json
+    ```powershell
+    # Create federated-credential-pr.json
+    @"
+    {
+      "name": "github-actions-pr",
+      "issuer": "https://token.actions.githubusercontent.com",
+      "subject": "repo:<your-org>/<your-repo>:pull_request",
+      "audiences": ["api://AzureADTokenExchange"]
+    }
+    "@ | Set-Content federated-credential-pr.json
 
-Remove-Item federated-credential-pr.json
-```
+    az ad app federated-credential create `
+      --id "<appId>" `
+      --parameters @federated-credential-pr.json
+
+    Remove-Item federated-credential-pr.json
+    ```
+
+2. **Immutable subject claim format.** Repositories created after July 15, 2026 (or opted in earlier) issue subjects with embedded numeric IDs: `repo:<org>@<ownerId>/<repo>@<repoId>:ref:refs/heads/main`. A credential created with the plain `repo:<org>/<repo>:...` subject will never match for these repositories, regardless of how many times you recreate it. Fetch the numeric IDs and rebuild the subject:
+
+    ```powershell
+    $repoInfo = Invoke-RestMethod -Uri "https://api.github.com/repos/<your-org>/<your-repo>"
+    "Owner ID: $($repoInfo.owner.id)  Repo ID: $($repoInfo.id)"
+    ```
+
+    Then recreate both federated credentials using `repo:<org>@<ownerId>/<repo>@<repoId>:ref:refs/heads/main` and `repo:<org>@<ownerId>/<repo>@<repoId>:pull_request`. See [Microsoft Learn: OpenID Connect reference — Immutable subject claims](https://docs.github.com/en/actions/reference/security/oidc#immutable-subject-claims) for details.
 
 ### Evaluator scoring seems inconsistent
 
@@ -739,6 +759,28 @@ Remove-Item federated-credential-pr.json
 - Increase quota in Azure portal if needed
 - Split large datasets into smaller batches
 - Add retry logic with exponential backoff
+
+### GitHub Actions run fails partway through with `AADSTS700024`
+
+**Symptom**: The workflow authenticates successfully at the start, then fails during the long polling step with `AADSTS700024: Client assertion is not within its valid time range`.
+
+**Resolution**:
+
+The GitHub OIDC token exchanged for an Azure AD token at job start is short-lived, and az CLI can't refresh it once the run outlives it. `evaluate_agent.py` requests a fresh GitHub OIDC token on each Azure AD refresh when running in GitHub Actions, so this shouldn't recur. If it still happens:
+- Confirm the workflow grants `id-token: write`
+- Confirm `AZURE_CLIENT_ID` and `AZURE_TENANT_ID` are available as env vars on the step running the script
+- An Entra ID access-token-lifetime policy does **not** fix this — it changes the resulting token's lifetime, not the OIDC assertion's validity window
+
+### Evaluation completes but shows "No scores returned"
+
+**Symptom**: The script reports `No scores returned` for all three metrics, but the Microsoft Foundry portal shows a completed run with populated scores.
+
+**Resolution**:
+
+The Evals API's per-item output field name can vary across SDK/API versions. `evaluate_agent.py` checks multiple known field names, but if none match:
+- Open the Report URL in the portal to confirm scores exist for the run
+- Check the `Debug: fields on first output item` line the script prints — it lists the actual field names so the score lookup can be extended
+- Pin `openai==2.24.0` (as set in `requirements.txt`) to match the schema this script was written against
 
 ## Next steps
 
