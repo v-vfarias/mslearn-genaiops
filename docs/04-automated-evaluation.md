@@ -405,6 +405,8 @@ The evaluation script integrates with GitHub Actions to automatically run evalua
     az ad sp create-for-rbac --name "github-agent-evaluator"
     ```
 
+    > **Note**: If you see the error AADSTS700024 after running an `az` command once the evaluation has completed, your terminal session simply timed out during the long run — run `az login` again or `az login --use-device-code`and rerun the command above.
+
     Save the `appId` and `tenant` values from the output. The workflow below uses OIDC federated credentials, so the generated `password` is not used in this lab.
 
     Assign the **Foundry User** role so the service principal can call the Foundry project API:
